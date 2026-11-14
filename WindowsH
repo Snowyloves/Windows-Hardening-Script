@@ -1,0 +1,829 @@
+<#
+.SYNOPSIS
+    Windows hardening + review script for CyberPatriot-style defensive competitions.
+
+.DESCRIPTION
+    1. Backs up current settings (registry, firewall, secedit, services, shares).
+    2. Produces a REVIEW REPORT of things that need human judgment
+       (users, groups, shares, ports, startup items, tasks, software, media files).
+    3. Applies hardening: account/password policy, audit policy, security options,
+       services, SMB, RDP/WinRM, firewall, Defender, Windows Update, TLS, logging.
+
+    READ THE README FIRST. Anything the README says must stay (IIS, FTP, RDP, printing,
+    file sharing, specific services) needs a -Keep* switch or -KeepServices entry,
+    otherwise this script may disable it and cost you points.
+
+.EXAMPLES
+    # Look only, change nothing (do this first, also for forensics questions):
+    .\Harden-Windows.ps1 -ReportOnly
+
+    # Typical run:
+    .\Harden-Windows.ps1 -AuthorizedUsers alice,bob,carol -AuthorizedAdmins alice
+
+    # README says RDP + web server + printing are required:
+    .\Harden-Windows.ps1 -AuthorizedUsers alice,bob -AuthorizedAdmins alice -KeepRDP -KeepPrintSpooler -KeepServices W3SVC,FTPSVC
+
+    # Also set a new password for every other local user:
+    .\Harden-Windows.ps1 -AuthorizedUsers alice,bob -AuthorizedAdmins alice -ResetPasswords
+
+.NOTES
+    Run from an elevated PowerShell:  powershell -ExecutionPolicy Bypass -File .\Harden-Windows.ps1
+    Output goes to C:\CP-Hardening\<timestamp>\ (log, review report, backups).
+#>
+[CmdletBinding()]
+param(
+    [string[]]$AuthorizedUsers  = @(),   # every legit local user from the README (admins too)
+    [string[]]$AuthorizedAdmins = @(),   # users who SHOULD be administrators
+    [string[]]$KeepServices     = @(),   # service names to leave alone, e.g. W3SVC,FTPSVC,MSSQLSERVER
+    [switch]$KeepRDP,
+    [switch]$KeepFileSharing,
+    [switch]$KeepPrintSpooler,
+    [switch]$KeepWinRM,
+    [switch]$ResetPasswords,
+    [switch]$SkipTLS,                    # skip SCHANNEL protocol/cipher changes
+    [switch]$ReportOnly                  # review report only, no changes
+)
+
+# ----------------------------------------------------------------------------
+# Setup / helpers
+# ----------------------------------------------------------------------------
+$principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Error 'Run this script from an elevated (Administrator) PowerShell.'
+    exit 1
+}
+
+$ErrorActionPreference = 'Continue'
+$Stamp      = Get-Date -Format 'yyyyMMdd-HHmmss'
+$Dir        = Join-Path 'C:\CP-Hardening' $Stamp
+New-Item -ItemType Directory -Path $Dir -Force | Out-Null
+$LogFile    = Join-Path $Dir 'hardening.log'
+$ReportFile = Join-Path $Dir 'review-report.txt'
+$Me         = $env:USERNAME
+
+function Log {
+    param([string]$Msg, [string]$Level = 'INFO')
+    $line = '[{0}] [{1}] {2}' -f (Get-Date -Format 'HH:mm:ss'), $Level, $Msg
+    $color = switch ($Level) { 'WARN' {'Yellow'} 'ERR' {'Red'} 'REVIEW' {'Magenta'} 'OK' {'Green'} default {'Gray'} }
+    Write-Host $line -ForegroundColor $color
+    Add-Content -Path $LogFile -Value $line
+}
+function Section([string]$t) { Log "==== $t ====" 'OK' }
+
+function Try-Do {
+    param([string]$Desc, [scriptblock]$Action)
+    try { & $Action; Log $Desc 'OK' }
+    catch { Log "$Desc -> $($_.Exception.Message)" 'ERR' }
+}
+
+function Set-Reg {
+    param([string]$Path, [string]$Name, $Value, [string]$Type = 'DWord')
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force | Out-Null }
+        New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
+        Log "$Path\$Name = $Value"
+    } catch { Log "FAILED $Path\$Name : $($_.Exception.Message)" 'ERR' }
+}
+
+function Remove-RegValue {
+    param([string]$Path, [string]$Name)
+    if (Test-Path -LiteralPath $Path) {
+        if ($null -ne (Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction SilentlyContinue)) {
+            Remove-ItemProperty -LiteralPath $Path -Name $Name -Force -ErrorAction SilentlyContinue
+            Log "Removed $Path\$Name"
+        }
+    }
+}
+
+function RptHeader([string]$t) {
+    Add-Content -Path $ReportFile -Value "`r`n=== $t ==="
+    Write-Host "`n=== $t ===" -ForegroundColor Cyan
+}
+function Rpt([string]$t) {
+    Add-Content -Path $ReportFile -Value $t
+    Write-Host $t -ForegroundColor Magenta
+}
+function RptTable($obj) {
+    $s = ($obj | Format-Table -AutoSize -Wrap | Out-String -Width 220)
+    Add-Content -Path $ReportFile -Value $s
+    Write-Host $s
+}
+
+function Disable-Svc {
+    param([string]$Name)
+    $s = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    if (-not $s) { return }
+    if ($KeepServices -contains $Name) { Log "Keeping service $Name (requested)" 'WARN'; return }
+    Try-Do "Disable service $Name" {
+        Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue
+        Set-Service -Name $Name -StartupType Disabled
+    }
+}
+
+function Set-IniValue {
+    param([string[]]$Lines, [string]$Section, [string]$Key, [string]$Value)
+    $out = New-Object System.Collections.Generic.List[string]
+    $inSec = $false; $done = $false
+    foreach ($l in $Lines) {
+        if ($l -match '^\s*\[(.+)\]\s*$') {
+            if ($inSec -and -not $done) { $out.Add("$Key = $Value"); $done = $true }
+            $inSec = ($Matches[1] -eq $Section)
+            $out.Add($l); continue
+        }
+        if ($inSec -and $l -match ('^\s*' + [regex]::Escape($Key) + '\s*=')) {
+            $out.Add("$Key = $Value"); $done = $true; continue
+        }
+        $out.Add($l)
+    }
+    if ($inSec -and -not $done) { $out.Add("$Key = $Value"); $done = $true }
+    if (-not $done) { $out.Add("[$Section]"); $out.Add("$Key = $Value") }
+    return , $out.ToArray()
+}
+
+function Set-SchannelKey {
+    param([string]$SubPath, [int]$Enabled, [int]$DisabledByDefault = -1)
+    $k = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey("SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\$SubPath")
+    $k.SetValue('Enabled', $Enabled, [Microsoft.Win32.RegistryValueKind]::DWord)
+    if ($DisabledByDefault -ge 0) { $k.SetValue('DisabledByDefault', $DisabledByDefault, [Microsoft.Win32.RegistryValueKind]::DWord) }
+    $k.Close()
+}
+
+$AllAuthorized = @($AuthorizedUsers) + @($AuthorizedAdmins) | Sort-Object -Unique
+function In-List { param([string]$Name, [string[]]$List) return ($List | Where-Object { $_ -ieq $Name }).Count -gt 0 }
+
+# ----------------------------------------------------------------------------
+# 0. Backups
+# ----------------------------------------------------------------------------
+function Invoke-Backup {
+    Section 'Backups (restore point, registry, firewall, secedit, services, shares)'
+    Try-Do 'System restore point' {
+        Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction SilentlyContinue
+        Checkpoint-Computer -Description "CP-Hardening-$Stamp" -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
+    }
+    foreach ($k in @(
+        @{n='policies';  p='HKLM\SOFTWARE\Policies'},
+        @{n='winpolicies'; p='HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies'},
+        @{n='lsa';       p='HKLM\SYSTEM\CurrentControlSet\Control\Lsa'},
+        @{n='lanman';    p='HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer'},
+        @{n='tcpip';     p='HKLM\SYSTEM\CurrentControlSet\Services\Tcpip'},
+        @{n='schannel';  p='HKLM\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL'},
+        @{n='terminal';  p='HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server'}
+    )) {
+        reg export $k.p (Join-Path $Dir "$($k.n).reg") /y 2>&1 | Out-Null
+    }
+    secedit /export /cfg (Join-Path $Dir 'secpol-before.inf') /quiet
+    netsh advfirewall export (Join-Path $Dir 'firewall-before.wfw') | Out-Null
+    Get-CimInstance Win32_Service | Select-Object Name, StartMode, State, PathName |
+        Export-Csv (Join-Path $Dir 'services-before.csv') -NoTypeInformation
+    Try-Do 'Export SMB shares' { Get-SmbShare | Select-Object Name, Path, Description | Export-Csv (Join-Path $Dir 'shares-before.csv') -NoTypeInformation }
+    auditpol /backup /file:(Join-Path $Dir 'auditpol-before.csv') | Out-Null
+    Log "Backups saved in $Dir"
+}
+
+# ----------------------------------------------------------------------------
+# 1. REVIEW REPORT (read-only, needs human judgment)
+# ----------------------------------------------------------------------------
+function Invoke-Review {
+    Section 'Review report (read-only)'
+    Set-Content -Path $ReportFile -Value "CyberPatriot review report  $(Get-Date)  host=$env:COMPUTERNAME  user=$Me"
+
+    RptHeader 'Local users'
+    RptTable (Get-LocalUser | Select-Object Name, Enabled, PasswordRequired, PasswordLastSet, LastLogon, PasswordExpires, Description)
+
+    RptHeader 'Privileged group membership'
+    foreach ($sid in 'S-1-5-32-544','S-1-5-32-547','S-1-5-32-551','S-1-5-32-555','S-1-5-32-580','S-1-5-32-558','S-1-5-32-578') {
+        $g = Get-LocalGroup | Where-Object { $_.SID.Value -eq $sid }
+        if ($g) {
+            Add-Content $ReportFile "-- $($g.Name)"
+            Write-Host "-- $($g.Name)" -ForegroundColor Cyan
+            $m = Get-LocalGroupMember -Group $g.Name -ErrorAction SilentlyContinue
+            if ($m) { RptTable ($m | Select-Object Name, ObjectClass, PrincipalSource) } else { Rpt '   (empty)' }
+        }
+    }
+
+    if ($AllAuthorized.Count -gt 0) {
+        RptHeader 'Users NOT in your authorized list'
+        Get-LocalUser | Where-Object { -not (In-List $_.Name $AllAuthorized) -and $_.Name -notin 'Administrator','Guest','DefaultAccount','WDAGUtilityAccount' } |
+            ForEach-Object { Rpt "UNAUTHORIZED? $($_.Name) (Enabled=$($_.Enabled))" }
+        RptHeader 'Authorized users that do not exist locally'
+        $AllAuthorized | Where-Object { -not (Get-LocalUser -Name $_ -ErrorAction SilentlyContinue) } | ForEach-Object { Rpt "MISSING: $_ (README may want you to create them)" }
+    }
+
+    RptHeader 'Network shares'
+    RptTable (Get-SmbShare | Select-Object Name, Path, Description)
+
+    RptHeader 'Listening TCP ports and owning process'
+    RptTable (Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+        Select-Object LocalAddress, LocalPort,
+            @{n='Process'; e={ (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).Name }},
+            @{n='Path';    e={ (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).Path }} |
+        Sort-Object LocalPort)
+
+    RptHeader 'Non-Microsoft / non-Windows services'
+    RptTable (Get-CimInstance Win32_Service |
+        Where-Object { $_.PathName -and $_.PathName -notmatch '(?i)\\Windows\\|svchost|Microsoft|Windows Defender' } |
+        Select-Object Name, State, StartMode, PathName)
+
+    RptHeader 'Unquoted service paths (privilege-escalation risk)'
+    RptTable (Get-CimInstance Win32_Service |
+        Where-Object { $_.PathName -and $_.PathName -notmatch '^"' -and $_.PathName -match '^[A-Za-z]:\\[^"]*? [^"]*?\.exe' -and $_.PathName -notmatch '^[A-Za-z]:\\Windows\\' } |
+        Select-Object Name, PathName)
+
+    RptHeader 'Services that commonly matter (state)'
+    $watch = 'W3SVC','FTPSVC','MSFTPSVC','SMTPSVC','sshd','TermService','WinRM','Spooler','LanmanServer','RemoteRegistry','TlntSvr','SNMP','MSSQLSERVER','MySQL','Apache2.4','nginx','vncserver','TeamViewer','AnyDesk'
+    RptTable (Get-Service -Name $watch -ErrorAction SilentlyContinue | Select-Object Name, Status, StartType)
+
+    RptHeader 'Startup entries (Run keys)'
+    foreach ($p in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run','HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce',
+                   'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run','HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run','HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce') {
+        if (Test-Path $p) {
+            Add-Content $ReportFile "-- $p"
+            (Get-ItemProperty $p).PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' } | ForEach-Object { Rpt "   $($_.Name) = $($_.Value)" }
+        }
+    }
+    foreach ($f in "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup", "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup") {
+        Get-ChildItem $f -Force -ErrorAction SilentlyContinue | ForEach-Object { Rpt "STARTUP FOLDER: $($_.FullName)" }
+    }
+
+    RptHeader 'Winlogon / IFEO backdoor checks'
+    $wl = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction SilentlyContinue
+    Rpt "Shell    = $($wl.Shell)   (expected explorer.exe)"
+    Rpt "Userinit = $($wl.Userinit) (expected C:\Windows\system32\userinit.exe,)"
+    if ($wl.AutoAdminLogon -eq '1') { Rpt "AUTOLOGON ENABLED for $($wl.DefaultUserName)" }
+    if ($wl.DefaultPassword)        { Rpt 'DefaultPassword is stored in cleartext in Winlogon key!' }
+    Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options' -ErrorAction SilentlyContinue |
+        ForEach-Object { $d = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).Debugger; if ($d) { Rpt "IFEO Debugger: $($_.PSChildName) -> $d" } }
+
+    RptHeader 'Scheduled tasks (non-Microsoft)'
+    RptTable (Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskPath -notlike '\Microsoft\*' } |
+        Select-Object TaskName, TaskPath, State, @{n='Run'; e={ ($_.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments)" }) -join '; ' }})
+
+    RptHeader 'Hosts file (non-comment lines)'
+    Get-Content "$env:windir\System32\drivers\etc\hosts" | Where-Object { $_ -notmatch '^\s*#' -and $_.Trim() } | ForEach-Object { Rpt "   $_" }
+
+    RptHeader 'Installed software (suspicious names flagged)'
+    $bad = 'wireshark|nmap|zenmap|john|hashcat|cain|netcat|ncat|keylog|utorrent|bittorrent|qbittorrent|limewire|vuze|frostwire|tightvnc|ultravnc|realvnc|teamviewer|anydesk|logmein|ophcrack|metasploit|burp|aircrack|angry ip|hydra|pwdump|mimikatz|cheat engine|crack|keygen|steam|minecraft|discord|pidgin|gaming'
+    $apps = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*','HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+        Where-Object DisplayName | Sort-Object DisplayName
+    foreach ($a in $apps) {
+        $flag = if ($a.DisplayName -match $bad) { '  <== REVIEW' } else { '' }
+        Rpt ("   {0} {1}{2}" -f $a.DisplayName, $a.DisplayVersion, $flag)
+    }
+
+    RptHeader 'Prohibited-media / sensitive-looking files'
+    $roots = @('C:\Users') + (Get-ChildItem 'C:\' -Directory -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notin 'Windows','Program Files','Program Files (x86)','$Recycle.Bin','System Volume Information','PerfLogs','ProgramData','Users','Recovery','CP-Hardening' } |
+        ForEach-Object { $_.FullName })
+    $media = '*.mp3','*.mp4','*.m4a','*.wav','*.flac','*.ogg','*.wma','*.avi','*.mkv','*.mov','*.wmv','*.mpg','*.mpeg','*.torrent'
+    foreach ($r in $roots) {
+        Get-ChildItem -Path $r -Include $media -Recurse -Force -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch '\\AppData\\Local\\(Microsoft|Packages)|\\Windows\\' } |
+            ForEach-Object { Rpt "MEDIA: $($_.FullName)" }
+        Get-ChildItem -Path $r -Include '*password*','*passwd*','*creds*','*credential*','*secret*','*.kdbx','*.pwd' -Recurse -Force -File -ErrorAction SilentlyContinue |
+            ForEach-Object { Rpt "SENSITIVE?: $($_.FullName)" }
+    }
+
+    RptHeader 'Defender exclusions (attackers love these)'
+    $mp = Get-MpPreference -ErrorAction SilentlyContinue
+    if ($mp) {
+        $mp.ExclusionPath      | ForEach-Object { Rpt "Excl path: $_" }
+        $mp.ExclusionExtension | ForEach-Object { Rpt "Excl ext: $_" }
+        $mp.ExclusionProcess   | ForEach-Object { Rpt "Excl proc: $_" }
+    }
+
+    Log "Review report written to $ReportFile" 'REVIEW'
+}
+
+# ----------------------------------------------------------------------------
+# 2. Accounts
+# ----------------------------------------------------------------------------
+function Invoke-Accounts {
+    Section 'User accounts'
+    $builtin = 'DefaultAccount','WDAGUtilityAccount'
+
+    Get-LocalUser | ForEach-Object {
+        $u = $_
+        $isBuiltinAdmin = $u.SID.Value -like '*-500'
+        if ($u.Name -eq 'Guest' -or $u.SID.Value -like '*-501') {
+            if ($u.Enabled) { Try-Do 'Disable Guest account' { Disable-LocalUser -Name $u.Name } }
+            return
+        }
+        if ($builtin -contains $u.Name) { if ($u.Enabled) { Try-Do "Disable $($u.Name)" { Disable-LocalUser -Name $u.Name } }; return }
+        if ($isBuiltinAdmin) {
+            if ($u.Enabled -and $u.Name -ne $Me) { Try-Do 'Disable built-in Administrator' { Disable-LocalUser -Name $u.Name } }
+            return
+        }
+        if ($AllAuthorized.Count -gt 0 -and -not (In-List $u.Name $AllAuthorized)) {
+            if ($u.Enabled) {
+                Log "Unauthorized user '$($u.Name)' DISABLED (not deleted). Delete manually after confirming README." 'REVIEW'
+                Try-Do "Disable $($u.Name)" { Disable-LocalUser -Name $u.Name }
+            }
+            return
+        }
+        if ($u.Enabled) {
+            Try-Do "Password must expire / be required: $($u.Name)" {
+                Set-LocalUser -Name $u.Name -PasswordNeverExpires $false
+                net user $u.Name /passwordreq:yes | Out-Null
+            }
+        }
+    }
+
+    # Administrators group
+    $adminGrp = (Get-LocalGroup | Where-Object { $_.SID.Value -eq 'S-1-5-32-544' }).Name
+    if ($AuthorizedAdmins.Count -gt 0) {
+        Get-LocalGroupMember -Group $adminGrp -ErrorAction SilentlyContinue | Where-Object { $_.ObjectClass -eq 'User' -and $_.PrincipalSource -eq 'Local' } | ForEach-Object {
+            $n = $_.Name.Split('\')[-1]
+            if ($_.SID.Value -like '*-500' -or $n -eq $Me) { return }
+            if (-not (In-List $n $AuthorizedAdmins)) {
+                Try-Do "Remove $n from Administrators" { Remove-LocalGroupMember -Group $adminGrp -Member $_.Name }
+            }
+        }
+        foreach ($a in $AuthorizedAdmins) {
+            if ((Get-LocalUser -Name $a -ErrorAction SilentlyContinue) -and -not (Get-LocalGroupMember -Group $adminGrp -ErrorAction SilentlyContinue | Where-Object { $_.Name.Split('\')[-1] -ieq $a })) {
+                Try-Do "Add $a to Administrators" { Add-LocalGroupMember -Group $adminGrp -Member $a }
+            }
+        }
+    } else {
+        Log 'No -AuthorizedAdmins given: Administrators group left unchanged (see report).' 'WARN'
+    }
+
+    # Prune risky groups of unauthorized users
+    foreach ($sid in 'S-1-5-32-551','S-1-5-32-547','S-1-5-32-555') {   # Backup Ops, Power Users, Remote Desktop Users
+        $g = Get-LocalGroup | Where-Object { $_.SID.Value -eq $sid }
+        if ($g -and $AllAuthorized.Count -gt 0) {
+            Get-LocalGroupMember -Group $g.Name -ErrorAction SilentlyContinue | Where-Object { $_.ObjectClass -eq 'User' } | ForEach-Object {
+                if (-not (In-List $_.Name.Split('\')[-1] $AllAuthorized)) {
+                    Try-Do "Remove $($_.Name) from $($g.Name)" { Remove-LocalGroupMember -Group $g.Name -Member $_.Name }
+                }
+            }
+        }
+    }
+
+    if ($ResetPasswords) {
+        $pw = Read-Host 'NEW password for all OTHER enabled local users (14+ chars, upper/lower/digit/symbol)' -AsSecureString
+        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($pw)
+        $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        if ($plain.Length -lt 14) {
+            Log 'Password too short; skipping password reset.' 'ERR'
+        } else {
+            Get-LocalUser | Where-Object { $_.Enabled -and $_.Name -ne $Me } | ForEach-Object {
+                Try-Do "Reset password: $($_.Name)" { Set-LocalUser -Name $_.Name -Password $pw }
+            }
+        }
+        $plain = $null
+    }
+    Log "Reminder: change YOUR OWN password ($Me) manually unless the README says otherwise." 'REVIEW'
+}
+
+# ----------------------------------------------------------------------------
+# 3. Local security policy (password, lockout, user rights) via secedit
+# ----------------------------------------------------------------------------
+function Invoke-SecPol {
+    Section 'Password / lockout policy and user rights (secedit)'
+    $cfg = Join-Path $env:TEMP 'cp-secpol.inf'
+    $db  = Join-Path $env:TEMP 'cp-secpol.sdb'
+    secedit /export /cfg $cfg /areas SECURITYPOLICY USER_RIGHTS /quiet
+    $lines = Get-Content $cfg
+
+    $sys = [ordered]@{
+        MinimumPasswordAge           = 1
+        MaximumPasswordAge           = 60
+        MinimumPasswordLength        = 14
+        PasswordComplexity           = 1
+        PasswordHistorySize          = 24
+        LockoutBadCount              = 5
+        ResetLockoutCount            = 30
+        LockoutDuration              = 30
+        RequireLogonToChangePassword = 0
+        ForceLogoffWhenHourExpire    = 1
+        ClearTextPassword            = 0
+        LSAAnonymousNameLookup       = 0
+    }
+    foreach ($k in $sys.Keys) { $lines = Set-IniValue -Lines $lines -Section 'System Access' -Key $k -Value $sys[$k] }
+
+    $rights = [ordered]@{
+        SeDenyNetworkLogonRight           = 'Guest,*S-1-5-32-546'
+        SeDenyRemoteInteractiveLogonRight = 'Guest,*S-1-5-32-546'
+        SeNetworkLogonRight               = '*S-1-5-32-544,*S-1-5-11'
+        SeTrustedCredManAccessPrivilege   = ''
+        SeTcbPrivilege                    = ''
+        SeCreateTokenPrivilege            = ''
+        SeLockMemoryPrivilege             = ''
+        SeEnableDelegationPrivilege       = ''
+        SeDebugPrivilege                  = '*S-1-5-32-544'
+        SeRemoteShutdownPrivilege         = '*S-1-5-32-544'
+    }
+    foreach ($k in $rights.Keys) { $lines = Set-IniValue -Lines $lines -Section 'Privilege Rights' -Key $k -Value $rights[$k] }
+
+    $lines | Set-Content -Path $cfg -Encoding Unicode
+    Try-Do 'Apply secedit policy' {
+        secedit /configure /db $db /cfg $cfg /areas SECURITYPOLICY USER_RIGHTS /quiet
+        if ($LASTEXITCODE -gt 1) { throw "secedit exit code $LASTEXITCODE (see %windir%\security\logs\scesrv.log)" }
+    }
+    Remove-Item $cfg, $db -Force -ErrorAction SilentlyContinue
+}
+
+# ----------------------------------------------------------------------------
+# 4. Audit policy + logging
+# ----------------------------------------------------------------------------
+function Invoke-Auditing {
+    Section 'Audit policy and event logging'
+    Try-Do 'Audit all categories success+failure' { auditpol /set '/category:*' /success:enable /failure:enable | Out-Null }
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'SCENoApplyLegacyAuditPolicy' 1
+    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' 'ProcessCreationIncludeCmdLine_Enabled' 1
+
+    foreach ($l in @(@('Security', 196608000), @('System', 67108864), @('Application', 67108864))) {
+        Try-Do "Event log size: $($l[0])" { wevtutil sl $l[0] /ms:$($l[1]) /rt:false }
+    }
+
+    $ps = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell'
+    Set-Reg "$ps\ScriptBlockLogging" 'EnableScriptBlockLogging' 1
+    Set-Reg "$ps\ModuleLogging" 'EnableModuleLogging' 1
+    Set-Reg "$ps\ModuleLogging\ModuleNames" '*' '*' 'String'
+    Set-Reg "$ps\Transcription" 'EnableTranscripting' 1
+    Set-Reg "$ps\Transcription" 'OutputDirectory' 'C:\PSTranscripts' 'String'
+    Set-Reg "$ps\Transcription" 'EnableInvocationHeader' 1
+}
+
+# ----------------------------------------------------------------------------
+# 5. Security options / registry hardening
+# ----------------------------------------------------------------------------
+function Invoke-RegistryHardening {
+    Section 'Security options (registry)'
+    $lsa = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
+    Set-Reg $lsa 'LmCompatibilityLevel' 5
+    Set-Reg $lsa 'NoLMHash' 1
+    Set-Reg $lsa 'RestrictAnonymous' 1
+    Set-Reg $lsa 'RestrictAnonymousSAM' 1
+    Set-Reg $lsa 'EveryoneIncludesAnonymous' 0
+    Set-Reg $lsa 'LimitBlankPasswordUse' 1
+    Set-Reg $lsa 'DisableDomainCreds' 1
+    Set-Reg $lsa 'ForceGuest' 0
+    Set-Reg $lsa 'RunAsPPL' 1
+    Set-Reg "$lsa\MSV1_0" 'NTLMMinClientSec' 537395200
+    Set-Reg "$lsa\MSV1_0" 'NTLMMinServerSec' 537395200
+    Set-Reg "$lsa\MSV1_0" 'allownullsessionfallback' 0
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' 'UseLogonCredential' 0
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'ProtectionMode' 1
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'SafeDllSearchMode' 1
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel' 'DisableExceptionChainValidation' 0
+
+    # UAC / interactive logon
+    $sys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+    Set-Reg $sys 'EnableLUA' 1
+    Set-Reg $sys 'ConsentPromptBehaviorAdmin' 2
+    Set-Reg $sys 'ConsentPromptBehaviorUser' 0
+    Set-Reg $sys 'PromptOnSecureDesktop' 1
+    Set-Reg $sys 'EnableInstallerDetection' 1
+    Set-Reg $sys 'EnableSecureUIAPaths' 1
+    Set-Reg $sys 'EnableVirtualization' 1
+    Set-Reg $sys 'FilterAdministratorToken' 1
+    Set-Reg $sys 'LocalAccountTokenFilterPolicy' 0
+    Set-Reg $sys 'DontDisplayLastUserName' 1
+    Set-Reg $sys 'DisableCAD' 0
+    Set-Reg $sys 'InactivityTimeoutSecs' 900
+    Set-Reg $sys 'ShutdownWithoutLogon' 0
+    Set-Reg $sys 'DisableAutomaticRestartSignOn' 1
+    Set-Reg $sys 'LegalNoticeCaption' 'Authorized Use Only' 'String'
+    Set-Reg $sys 'LegalNoticeText' 'This system is for authorized users only. Activity may be monitored and logged.' 'String'
+    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\CredUI' 'DisablePasswordReveal' 1
+    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\CredUI' 'EnumerateAdministrators' 0
+
+    # Winlogon: no autologon, no stored creds
+    $wl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+    Set-Reg $wl 'AutoAdminLogon' '0' 'String'
+    Remove-RegValue $wl 'DefaultPassword'
+    Set-Reg $wl 'CachedLogonsCount' '4' 'String'
+    Set-Reg $wl 'PasswordExpiryWarning' 14
+    Set-Reg $wl 'ScreenSaverGracePeriod' '0' 'String'
+    Set-Reg $wl 'AllocateDASD' '0' 'String'
+
+    # SMB / network access
+    $lms = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'
+    Set-Reg $lms 'RestrictNullSessAccess' 1
+    Set-Reg $lms 'RequireSecuritySignature' 1
+    Set-Reg $lms 'EnableSecuritySignature' 1
+    Set-Reg $lms 'SMB1' 0
+    Set-Reg $lms 'NullSessionPipes' @() 'MultiString'
+    Set-Reg $lms 'NullSessionShares' @() 'MultiString'
+    Set-Reg $lms 'autodisconnect' 15
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters' 'RequireSecuritySignature' 1
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters' 'EnableSecuritySignature' 1
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters' 'EnablePlainTextPassword' 0
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\LanmanWorkstation' 'AllowInsecureGuestAuth' 0
+    $nl = 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'
+    Set-Reg $nl 'RequireSignOrSeal' 1
+    Set-Reg $nl 'SealSecureChannel' 1
+    Set-Reg $nl 'SignSecureChannel' 1
+    Set-Reg $nl 'RequireStrongKey' 1
+    Set-Reg $nl 'DisablePasswordChange' 0
+    Set-Reg $nl 'MaximumPasswordAge' 30
+
+    # Autorun / autoplay
+    $exp = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'
+    Set-Reg $exp 'NoDriveTypeAutoRun' 255
+    Set-Reg $exp 'NoAutorun' 1
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer' 'NoAutoplayfornonVolume' 1
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\cdrom' 'AutoRun' 0
+
+    # Show hidden files / extensions for the current user (helps you spot junk)
+    $adv = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+    Set-Reg $adv 'Hidden' 1
+    Set-Reg $adv 'HideFileExt' 0
+    Set-Reg $adv 'ShowSuperHidden' 1
+
+    # Screen lock for current user
+    $cp = 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\Control Panel\Desktop'
+    Set-Reg $cp 'ScreenSaveActive' '1' 'String'
+    Set-Reg $cp 'ScreenSaverIsSecure' '1' 'String'
+    Set-Reg $cp 'ScreenSaveTimeOut' '900' 'String'
+
+    # Installer / misc
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer' 'AlwaysInstallElevated' 0
+    Set-Reg 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\Installer' 'AlwaysInstallElevated' 0
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' 'EnableSmartScreen' 1
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' 'ShellSmartScreenLevel' 'Block' 'String'
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' 'AllowTelemetry' 1
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' 'EnableCdp' 0
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search' 'AllowIndexingEncryptedStoresOrItems' 0
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization' 'NoLockScreenCamera' 1
+    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting' 'Disabled' 1
+
+    # Remote assistance always off
+    $ts = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+    Set-Reg $ts 'fAllowToGetHelp' 0
+    Set-Reg $ts 'fAllowFullControl' 0
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance' 'fAllowToGetHelp' 0
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance' 'fAllowFullControl' 0
+
+    # PrintNightmare-related
+    $pp = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint'
+    Set-Reg $pp 'NoWarningNoElevationOnInstall' 0
+    Set-Reg $pp 'UpdatePromptSettings' 0
+    Set-Reg $pp 'RestrictDriverInstallationToAdministrators' 1
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers' 'RegisterSpoolerRemoteRpcEndPoint' 2
+
+    # Edge policy
+    $edge = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'
+    Set-Reg $edge 'SmartScreenEnabled' 1
+    Set-Reg $edge 'PreventSmartScreenPromptOverride' 1
+    Set-Reg $edge 'SSLVersionMin' 'tls1.2' 'String'
+    Set-Reg $edge 'PasswordManagerEnabled' 0
+
+    # Network stack
+    $tcp = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'
+    Set-Reg $tcp 'DisableIPSourceRouting' 2
+    Set-Reg $tcp 'EnableICMPRedirect' 0
+    Set-Reg $tcp 'PerformRouterDiscovery' 0
+    Set-Reg $tcp 'EnableDeadGWDetect' 0
+    Set-Reg $tcp 'KeepAliveTime' 300000
+    Set-Reg $tcp 'IPEnableRouter' 0
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters' 'DisableIPSourceRouting' 2
+    Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters' 'NoNameReleaseOnDemand' 1
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' 'EnableMulticast' 0     # LLMNR off
+    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' 'EnableMDNS' 0
+    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\WinHttp' 'DisableWpad' 1
+    Try-Do 'Disable NetBIOS over TCP/IP on adapters' {
+        Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=TRUE' | ForEach-Object {
+            Invoke-CimMethod -InputObject $_ -MethodName SetTcpipNetbios -Arguments @{ TcpipNetbiosOptions = [uint32]2 } | Out-Null
+        }
+    }
+    Try-Do 'DEP AlwaysOn' { bcdedit /set '{current}' nx AlwaysOn | Out-Null }
+}
+
+# ----------------------------------------------------------------------------
+# 6. Services, SMB, RDP, WinRM, optional features
+# ----------------------------------------------------------------------------
+function Invoke-Services {
+    Section 'Services'
+    $risky = 'TlntSvr','RemoteRegistry','SNMP','SNMPTRAP','SSDPSRV','upnphost','simptcp','RemoteAccess','lltdsvc',
+             'p2psvc','p2pimsvc','PNRPsvc','PNRPAutoReg','Browser','icssvc','WMPNetworkSvc','NetTcpPortSharing',
+             'RpcLocator','Fax','irmon','SharedAccess','ssh-agent','MSiSCSI'
+    foreach ($s in $risky) { Disable-Svc $s }
+
+    if (-not $KeepPrintSpooler) { Disable-Svc 'Spooler' } else { Log 'Print Spooler kept (requested)' 'WARN' }
+
+    # Never auto-disabled: W3SVC, FTPSVC, SMTPSVC, sshd, database/web servers. Review them by hand.
+    foreach ($s in 'W3SVC','FTPSVC','MSFTPSVC','SMTPSVC','sshd') {
+        $svc = Get-Service -Name $s -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -eq 'Running') { Log "Service $s is running. If README does not need it, disable it manually." 'REVIEW' }
+    }
+
+    Section 'Windows Update'
+    $au = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+    Set-Reg $au 'NoAutoUpdate' 0
+    Set-Reg $au 'AUOptions' 4
+    Set-Reg $au 'ScheduledInstallDay' 0
+    Set-Reg $au 'ScheduledInstallTime' 3
+    Remove-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' 'DisableWindowsUpdateAccess'
+    Remove-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' 'WUServer'
+    Remove-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' 'WUStatusServer'
+    Remove-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' 'UseWUServer'
+    foreach ($s in 'wuauserv','UsoSvc','bits') {
+        Try-Do "Enable $s" { Set-Service -Name $s -StartupType Manual -ErrorAction Stop; Start-Service -Name $s -ErrorAction SilentlyContinue }
+    }
+    Try-Do 'Trigger update scan' { Start-Process -FilePath "$env:windir\System32\UsoClient.exe" -ArgumentList 'StartScan' -WindowStyle Hidden }
+}
+
+function Invoke-NetworkServices {
+    Section 'SMB / file sharing'
+    Try-Do 'SMB server config' { Set-SmbServerConfiguration -EnableSMB1Protocol $false -EnableSMB2Protocol $true -RequireSecuritySignature $true -EnableSecuritySignature $true -Force -Confirm:$false }
+    Try-Do 'SMB client config' { Set-SmbClientConfiguration -RequireSecuritySignature $true -EnableSecuritySignature $true -Force -Confirm:$false }
+    if (-not $KeepFileSharing) {
+        Get-SmbShare | Where-Object { $_.Special -eq $false -and $_.Name -notin 'print$' } | ForEach-Object {
+            Log "Removing custom share '$($_.Name)' -> $($_.Path) (backup in shares-before.csv)" 'REVIEW'
+            Try-Do "Remove share $($_.Name)" { Remove-SmbShare -Name $_.Name -Force -Confirm:$false }
+        }
+        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' 'AutoShareWks' 0
+        Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' 'AutoShareServer' 0
+    } else { Log 'File sharing kept (requested); custom shares left in place, review their permissions.' 'WARN' }
+
+    Section 'Remote Desktop'
+    $tsr = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+    $tsp = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+    if ($KeepRDP) {
+        Set-Reg $tsr 'fDenyTSConnections' 0
+        Set-Reg "$tsr\WinStations\RDP-Tcp" 'UserAuthentication' 1
+        Set-Reg "$tsr\WinStations\RDP-Tcp" 'SecurityLayer' 2
+        Set-Reg "$tsr\WinStations\RDP-Tcp" 'MinEncryptionLevel' 3
+        Set-Reg $tsp 'UserAuthentication' 1
+        Set-Reg $tsp 'SecurityLayer' 2
+        Set-Reg $tsp 'MinEncryptionLevel' 3
+        Set-Reg $tsp 'fPromptForPassword' 1
+        Set-Reg $tsp 'MaxIdleTime' 900000
+        Set-Reg $tsp 'MaxDisconnectionTime' 60000
+        Log 'RDP kept with NLA + high encryption. Remove unauthorized users from Remote Desktop Users.' 'WARN'
+    } else {
+        Set-Reg $tsr 'fDenyTSConnections' 1
+        Set-Reg $tsp 'fDenyTSConnections' 1
+        Try-Do 'Disable RDP firewall rules' { Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue | Disable-NetFirewallRule }
+    }
+
+    Section 'WinRM / PowerShell remoting'
+    $wr = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM'
+    Set-Reg "$wr\Client"  'AllowBasic' 0
+    Set-Reg "$wr\Client"  'AllowUnencryptedTraffic' 0
+    Set-Reg "$wr\Client"  'AllowDigest' 0
+    Set-Reg "$wr\Service" 'AllowBasic' 0
+    Set-Reg "$wr\Service" 'AllowUnencryptedTraffic' 0
+    Set-Reg "$wr\Service" 'DisableRunAs' 1
+    if (-not $KeepWinRM) {
+        Try-Do 'Disable WinRM' { Disable-PSRemoting -Force -ErrorAction SilentlyContinue; Stop-Service WinRM -Force -ErrorAction SilentlyContinue; Set-Service WinRM -StartupType Disabled }
+    }
+
+    Section 'Optional Windows features'
+    foreach ($f in 'SMB1Protocol','SMB1Protocol-Client','SMB1Protocol-Server','MicrosoftWindowsPowerShellV2','MicrosoftWindowsPowerShellV2Root','TelnetClient','TFTP','TelnetServer','SimpleTCP') {
+        try {
+            $feat = Get-WindowsOptionalFeature -Online -FeatureName $f -ErrorAction Stop
+            if ($feat.State -eq 'Enabled') { Try-Do "Disable feature $f" { Disable-WindowsOptionalFeature -Online -FeatureName $f -NoRestart -ErrorAction Stop | Out-Null } }
+        } catch { }
+    }
+    if (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) {   # Server SKUs
+        foreach ($f in 'Telnet-Client','TFTP-Client','SNMP-Service','FS-SMB1','PowerShell-V2') {
+            $x = Get-WindowsFeature -Name $f -ErrorAction SilentlyContinue
+            if ($x -and $x.Installed) { Try-Do "Uninstall feature $f" { Uninstall-WindowsFeature -Name $f | Out-Null } }
+        }
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 7. Firewall
+# ----------------------------------------------------------------------------
+function Invoke-Firewall {
+    Section 'Windows Defender Firewall'
+    Try-Do 'Enable firewall on all profiles, block inbound by default, log drops' {
+        Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True -DefaultInboundAction Block -DefaultOutboundAction Allow `
+            -NotifyOnListen True -AllowUnicastResponseToMulticast False -LogBlocked True -LogAllowed False `
+            -LogMaxSizeKilobytes 16384 -LogFileName '%systemroot%\system32\LogFiles\Firewall\pfirewall.log'
+    }
+    Try-Do 'Make sure firewall service is on' { Set-Service -Name mpssvc -StartupType Automatic; Start-Service mpssvc -ErrorAction SilentlyContinue }
+    Remove-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile' 'EnableFirewall'
+    Remove-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\StandardProfile' 'EnableFirewall'
+    Remove-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile' 'EnableFirewall'
+
+    $groups = @('Remote Assistance','Windows Media Player Network Sharing Service','Network Discovery','Telnet Server','Windows Peer to Peer Collaboration Foundation','Wireless Portable Devices','mDNS','Cast to Device functionality')
+    if (-not $KeepRDP)         { $groups += 'Remote Desktop' }
+    if (-not $KeepWinRM)       { $groups += 'Windows Remote Management' }
+    if (-not $KeepFileSharing) { $groups += 'File and Printer Sharing' }
+    foreach ($g in $groups) {
+        Try-Do "Disable firewall rule group: $g" {
+            Get-NetFirewallRule -DisplayGroup $g -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -eq 'True' } | Disable-NetFirewallRule
+        }
+    }
+    Try-Do 'Block inbound Telnet/TFTP/NetBIOS-NS ports' {
+        New-NetFirewallRule -DisplayName 'CP Block Telnet/TFTP inbound' -Direction Inbound -Action Block -Protocol TCP -LocalPort 23 -ErrorAction SilentlyContinue | Out-Null
+        New-NetFirewallRule -DisplayName 'CP Block TFTP inbound' -Direction Inbound -Action Block -Protocol UDP -LocalPort 69 -ErrorAction SilentlyContinue | Out-Null
+    }
+    Log 'Listening-port report is in review-report.txt. Verify scored services still have inbound allow rules.' 'REVIEW'
+}
+
+# ----------------------------------------------------------------------------
+# 8. Microsoft Defender
+# ----------------------------------------------------------------------------
+function Invoke-Defender {
+    Section 'Microsoft Defender'
+    $dp = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'
+    foreach ($n in 'DisableAntiSpyware','DisableAntiVirus','ServiceKeepAlive') { Remove-RegValue $dp $n }
+    foreach ($n in 'DisableRealtimeMonitoring','DisableBehaviorMonitoring','DisableOnAccessProtection','DisableIOAVProtection','DisableScriptScanning') {
+        Remove-RegValue "$dp\Real-Time Protection" $n
+    }
+    Try-Do 'Defender service on' { Set-Service -Name WinDefend -StartupType Automatic -ErrorAction SilentlyContinue; Start-Service WinDefend -ErrorAction SilentlyContinue }
+
+    Try-Do 'Defender preferences' {
+        Set-MpPreference -DisableRealtimeMonitoring $false -DisableBehaviorMonitoring $false -DisableIOAVProtection $false `
+            -DisableScriptScanning $false -DisableArchiveScanning $false -DisableEmailScanning $false -DisableRemovableDriveScanning $false `
+            -MAPSReporting Advanced -SubmitSamplesConsent SendSafeSamples -PUAProtection Enabled -CloudBlockLevel High `
+            -CloudExtendedTimeout 50 -EnableNetworkProtection Enabled -EnableFileHashComputation $true -ErrorAction Stop
+    }
+
+    $mp = Get-MpPreference -ErrorAction SilentlyContinue
+    if ($mp) {
+        foreach ($p in @($mp.ExclusionPath))      { if ($p) { Try-Do "Remove exclusion path $p" { Remove-MpPreference -ExclusionPath $p } } }
+        foreach ($e in @($mp.ExclusionExtension)) { if ($e) { Try-Do "Remove exclusion ext $e"  { Remove-MpPreference -ExclusionExtension $e } } }
+        foreach ($x in @($mp.ExclusionProcess))   { if ($x) { Try-Do "Remove exclusion proc $x" { Remove-MpPreference -ExclusionProcess $x } } }
+    }
+
+    $asr = [ordered]@{
+        'BE9BA2D9-53EA-4CDC-84E5-9B1EEEE46550' = 'Block executable content from email/webmail'
+        'D4F940AB-401B-4EFC-AADC-AD5F3C50688A' = 'Block Office apps from creating child processes'
+        '3B576869-A4EC-4529-8536-B80A7769E899' = 'Block Office apps from creating executable content'
+        '75668C1F-73B5-4CF0-BB93-3ECF5CB7CC84' = 'Block Office apps from injecting code'
+        'D3E037E1-3EB8-44C8-A917-57927947596D' = 'Block JS/VBS launching downloaded executables'
+        '5BEB7EFE-FD9A-4556-801D-275E5FFC04CC' = 'Block execution of potentially obfuscated scripts'
+        '92E97FA1-2EDF-4476-BDD6-9DD0B4DDDC7B' = 'Block Win32 API calls from Office macros'
+        '9E6C4E1F-7D60-472F-BA1A-A39EF669E4B2' = 'Block credential stealing from LSASS'
+        'B2B3F03D-6A65-4F7B-A9C7-1C7EF74A9BA4' = 'Block untrusted processes from USB'
+        '56A863A9-875E-4185-98A7-B882C64B5CE5' = 'Block abuse of exploited vulnerable signed drivers'
+    }
+    foreach ($id in $asr.Keys) {
+        Try-Do "ASR: $($asr[$id])" { Add-MpPreference -AttackSurfaceReductionRules_Ids $id -AttackSurfaceReductionRules_Actions Enabled -ErrorAction Stop }
+    }
+
+    Try-Do 'Update Defender signatures' { Update-MpSignature -ErrorAction Stop }
+    Try-Do 'Start background quick scan' { Start-MpScan -ScanType QuickScan -AsJob | Out-Null }
+}
+
+# ----------------------------------------------------------------------------
+# 9. TLS / cipher hardening
+# ----------------------------------------------------------------------------
+function Invoke-TLS {
+    Section 'SCHANNEL protocols and ciphers'
+    foreach ($p in 'SSL 2.0','SSL 3.0','TLS 1.0','TLS 1.1') {
+        foreach ($side in 'Server','Client') {
+            Try-Do "Disable $p ($side)" { Set-SchannelKey "Protocols\$p\$side" 0 1 }
+        }
+    }
+    foreach ($side in 'Server','Client') {
+        Try-Do "Enable TLS 1.2 ($side)" { Set-SchannelKey "Protocols\TLS 1.2\$side" 1 0 }
+    }
+    foreach ($c in 'NULL','DES 56/56','RC2 40/128','RC2 56/128','RC2 128/128','RC4 40/128','RC4 56/128','RC4 64/128','RC4 128/128','Triple DES 168') {
+        Try-Do "Disable cipher $c" { Set-SchannelKey "Ciphers\$c" 0 }
+    }
+    Try-Do 'Disable MD5 hash' { Set-SchannelKey 'Hashes\MD5' 0 }
+    foreach ($k in 'HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319','HKLM:\SOFTWARE\WOW6432Node\Microsoft\.NETFramework\v4.0.30319') {
+        Set-Reg $k 'SchUseStrongCrypto' 1
+        Set-Reg $k 'SystemDefaultTlsVersions' 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+Log "Starting. Output folder: $Dir"
+Invoke-Review
+if ($ReportOnly) {
+    Log 'ReportOnly set: no changes made. Read the report, answer forensics questions, then re-run without -ReportOnly.' 'OK'
+    exit 0
+}
+
+Invoke-Backup
+Invoke-Accounts
+Invoke-SecPol
+Invoke-Auditing
+Invoke-RegistryHardening
+Invoke-Services
+Invoke-NetworkServices
+Invoke-Firewall
+Invoke-Defender
+if (-not $SkipTLS) { Invoke-TLS }
+Try-Do 'gpupdate' { gpupdate /force | Out-Null }
+
+Section 'DONE'
+Write-Host @"
+
+Finished. Log:    $LogFile
+          Report: $ReportFile
+          Backups: $Dir
+
+STILL DO BY HAND (the script cannot judge these):
+  * Re-read the README: users/admins, required services, required software, password rules.
+  * Go through review-report.txt: unauthorized users, odd shares, startup items, tasks, ports,
+    prohibited software/media, unquoted service paths, hosts file, IFEO entries.
+  * Delete (not just disable) unauthorized users once you're sure.
+  * Change your own password if the README allows; set blank-password accounts.
+  * Update / remove outdated or prohibited software (Programs and Features).
+  * Harden each app the README names (IIS/FTP/SQL/Apache/Firefox/Chrome settings, etc.).
+  * Run Windows Update to completion; reboot to finish RunAsPPL, SMB1 removal, TLS changes.
+  * Re-check the scoring report: if a service/feature broke, restore from the backups folder.
+"@ -ForegroundColor Cyan
